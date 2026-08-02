@@ -99,8 +99,8 @@ Impostali in **Settings → Secrets and variables → Actions** del repository:
 |---|---|
 | `API_ENCRYPTION_KEY` | Stessa chiave usata in HA per l'integrazione ESPHome |
 | `OTA_PASSWORD` | Password per gli aggiornamenti OTA nativi |
-| `WEB_SERVER_USERNAME` | Utente per l'accesso al web server locale del device |
-| `WEB_SERVER_PASSWORD` | Password per l'accesso al web server locale del device |
+| `WEB_SERVER_USERNAME` | Utente per l'accesso al web server locale del device (solo se il blocco `web_server` viene riabilitato, vedi sotto) |
+| `WEB_SERVER_PASSWORD` | Password per l'accesso al web server locale del device (idem) |
 
 Questi secrets vengono usati **solo** dal workflow `release.yml` per generare
 un `secrets.yaml` temporaneo durante la build in CI; non vengono mai
@@ -118,19 +118,52 @@ Il workflow compila il firmware e pubblica su GitHub Release il file
 
 ## Calibrazione a runtime
 
-Non serve riflashare per calibrare l'installazione. Da Home Assistant
-(o dal web server del device) sono esposti due parametri configurabili
-e persistiti in flash:
+Non serve riflashare per calibrare l'installazione. Da Home Assistant sono
+esposti due parametri configurabili e persistiti in flash:
 
 - **Empty Distance** (cm): distanza dal sensore al fondo quando vuoto
 - **Distance Offset** (cm): correzione fine della lettura grezza
 
 Il livello acqua e la percentuale vengono ricalcolati automaticamente da
-questi due valori.
+questi due valori, subito dopo ogni nuova misura (non su un
+`update_interval` separato).
+
+## Cadenza di misura adattiva
+
+Il sensore non misura a intervallo fisso: la cadenza si adatta in base a
+quanto varia il livello, per evitare misure inutili quando il pozzo è
+stabile (la variazione avviene quasi solo durante l'uso dell'irrigazione
+o lo svuotamento invernale).
+
+- **Modalità riposo** (default): una misura ogni **5 minuti**.
+- **Modalità attiva**: se la differenza tra due letture consecutive
+  supera la soglia **Active Mode Threshold** (default 10cm, regolabile
+  da Home Assistant senza riflashare), si passa a una misura ogni
+  **1 minuto**.
+- **Ritorno automatico al riposo**: dopo **10 minuti** consecutivi senza
+  variazioni sopra soglia.
+- **Prima misura al boot**: circa 3 secondi dopo l'avvio, indipendente
+  dal countdown della cadenza adattiva (altrimenti la primissima lettura
+  dopo un riavvio richiederebbe di aspettare l'intero countdown, fino a
+  5 minuti).
+
+Lo stato corrente (attivo/riposo) è visibile in Home Assistant tramite
+l'entità diagnostica **Active Measurement Mode**.
+
+Non è implementato un vero sleep del chip (deep/light sleep): ESPHome non
+espone light sleep in configurazione YAML per questa piattaforma, e il
+device è alimentato via PoE (non a batteria), quindi il risparmio
+energetico non è l'obiettivo — la cadenza adattiva riduce solo la
+frequenza dei trigger ultrasonici e delle pubblicazioni verso Home
+Assistant, non il consumo base di CPU/Ethernet.
 
 ## Web server locale
 
-Disponibile su `http://<ip-device>/` (protetto da username/password),
-utile per debug e per modificare i parametri sopra senza passare da HA.
-Non espone l'upload firmware via browser: l'OTA è disponibile solo tramite
-la piattaforma nativa (API, con password).
+Il blocco `web_server` è presente nello YAML ma **commentato/disabilitato**
+di default (non necessario: la configurazione e la calibrazione si
+gestiscono comodamente da Home Assistant). Per riabilitarlo, decommentare
+la sezione `web_server:` in `Esp32-Pozzo.yaml` — richiede i secrets
+`WEB_SERVER_USERNAME`/`WEB_SERVER_PASSWORD`. Se abilitato, sarà
+disponibile su `http://<ip-device>/` (protetto da autenticazione digest)
+e non espone comunque l'upload firmware via browser: l'OTA resta
+disponibile solo tramite la piattaforma nativa (API, con password).
