@@ -1,0 +1,171 @@
+substitutions:
+  # Distanza (cm) dal sensore al fondo pozzo/cisterna quando è vuoto.
+  # Usata per calcolare il livello come (empty_distance - misura).
+  empty_distance_cm: "200"
+  # Offset di calibrazione applicato in cm alla lettura grezza (+/-).
+  distance_offset_cm: "0"
+  # Intervallo di aggiornamento della misura.
+  update_interval: 30s
+
+esphome:
+  name: esp32-pozzo
+  friendly_name: "Esp32-Pozzo"
+  name_add_mac_suffix: false
+  project:
+    name: "nwitaly.water-level-esp32s3-eth"
+    version: "1.0.0"
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+# ---------------------------------------------------------------------------
+# Rete: Waveshare ESP32-S3-ETH monta un chip W5500 collegato via SPI, NON un
+# PHY ethernet nativo. Pinout confermato per la board ESP32-S3-ETH (POE).
+# ---------------------------------------------------------------------------
+ethernet:
+  type: W5500
+  mosi_pin: GPIO11
+  miso_pin: GPIO12
+  clk_pin: GPIO13
+  cs_pin: GPIO14
+  reset_pin: GPIO9
+  interrupt_pin: GPIO10
+  clock_speed: 25MHz
+
+# Logging
+logger:
+  level: INFO
+
+# API nativa per Home Assistant, protetta da encryption key
+api:
+  encryption:
+    key: !secret esp32_pozzo__encryption_key
+
+# OTA nativa via API, protetta da password.
+# NOTA: dalla 2025.7.0 l'OTA del web_server è una piattaforma separata
+# (platform: web_server) e va aggiunta esplicitamente con auth se serve;
+# qui la lasciamo fuori: l'update firmware passa solo dall'OTA nativa.
+ota:
+  - platform: esphome
+    password: !secret esp32_solaio__ota_password
+
+# Web server locale per vedere stato ed eventualmente cambiare parametri
+# a runtime (offset, empty_distance) tramite i number in basso.
+# NON esposta OTA firmware upload: nessuna piattaforma web_server sotto ota:.
+web_server:
+  version: 3
+  auth:
+    type: digest
+    username: admin
+    password: !secret esp32_pozzo__webserver_password
+
+# Permette di riavviare da HA/web se serve
+button:
+  - platform: restart
+    name: "Restart"
+
+# Sensore di stato connessione
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+# ---------------------------------------------------------------------------
+# Numeri configurabili a runtime (persistiti in flash), regolabili da HA o
+# dal web_server, senza dover riflashare per calibrare l'installazione.
+# ---------------------------------------------------------------------------
+number:
+  - platform: template
+    name: "Empty Distance"
+    id: empty_distance
+    icon: mdi:arrow-expand-vertical
+    entity_category: config
+    min_value: 10
+    max_value: 500
+    step: 1
+    unit_of_measurement: "cm"
+    optimistic: true
+    restore_value: true
+    initial_value: ${empty_distance_cm}
+
+  - platform: template
+    name: "Distance Offset"
+    id: distance_offset
+    icon: mdi:tune-variant
+    entity_category: config
+    min_value: -50
+    max_value: 50
+    step: 0.5
+    unit_of_measurement: "cm"
+    optimistic: true
+    restore_value: true
+    initial_value: ${distance_offset_cm}
+
+# ---------------------------------------------------------------------------
+# JSN-SR04T in Mode 0 (compatibile HC-SR04, trigger/echo classico).
+# Confermato via ispezione fisica: pad R19 sul modulo è aperto/senza
+# resistenza, che corrisponde a questa modalità (non seriale). Nessuna
+# modifica hardware necessaria: è la modalità di fabbrica di questo
+# esemplare, usata tramite il componente "ultrasonic" nativo di ESPHome
+# (protocollo standard, nessun componente custom o piattaforma UART).
+#
+# Alimentazione dal pin 5V (VBUS) della board.
+# TRIG (etichettato "RX/Trig" sul modulo) ← GPIO17, uscita diretta
+#   dall'ESP32, logic 3.3V, compatibile col modulo.
+# ECHO (etichettato "TX/Echo" sul modulo) → GPIO18, tramite partitore
+#   resistivo: il modulo lavora a 5V logic, l'ESP32 tollera max 3.3V.
+# NOTA: GPIO5 è riservato internamente all'interfaccia SD card (SD_MISO)
+# su questa board e non è esposto sul connettore: non utilizzabile.
+# ---------------------------------------------------------------------------
+sensor:
+  - platform: ultrasonic
+    trigger_pin: GPIO17
+    echo_pin: GPIO18
+    name: "Raw Distance"
+    id: raw_distance
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    update_interval: ${update_interval}
+    pulse_time: 400us
+    timeout: 4.5m # distanza massima misurabile (metri), non un tempo
+    filters:
+      - median:
+          window_size: 5
+          send_every: 5
+          send_first_at: 3
+      - lambda: return x * 100.0; # ultrasonic component espone metri, convertiamo in cm
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Water Level"
+    id: water_level
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    icon: mdi:waves-arrow-up
+    update_interval: ${update_interval}
+    lambda: |-
+      if (id(raw_distance).has_state()) {
+        float corrected = id(raw_distance).state + id(distance_offset).state;
+        float level = id(empty_distance).state - corrected;
+        if (level < 0) level = 0;
+        return level;
+      }
+      return {};
+
+  - platform: template
+    name: "Water Level Percent"
+    id: water_level_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:percent
+    update_interval: ${update_interval}
+    lambda: |-
+      if (id(water_level).has_state() && id(empty_distance).state > 0) {
+        float pct = (id(water_level).state / id(empty_distance).state) * 100.0;
+        if (pct > 100) pct = 100;
+        if (pct < 0) pct = 0;
+        return pct;
+      }
+      return {};

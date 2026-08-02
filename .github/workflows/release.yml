@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create secrets.yaml from GitHub Secrets
+        run: |
+          cat > secrets.yaml << EOF
+          api_encryption_key: "${{ secrets.API_ENCRYPTION_KEY }}"
+          ota_password: "${{ secrets.OTA_PASSWORD }}"
+          web_server_username: "${{ secrets.WEB_SERVER_USERNAME }}"
+          web_server_password: "${{ secrets.WEB_SERVER_PASSWORD }}"
+          EOF
+
+      - name: Build firmware
+        id: esphome-build
+        uses: esphome/build-action@v8.0.0
+        with:
+          yaml-file: water-level.yaml
+          version: latest
+          release-summary: "Release ${{ github.ref_name }}"
+          release-url: "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          complete-manifest: true
+
+      - name: Locate build output
+        id: locate
+        run: |
+          OUT_DIR="${{ steps.esphome-build.outputs.name }}"
+          echo "out_dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT_DIR"
+
+      - name: Publish GitHub Release with firmware assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.locate.outputs.out_dir }}/*.bin
+            ${{ steps.locate.outputs.out_dir }}/manifest.json
+          generate_release_notes: true
