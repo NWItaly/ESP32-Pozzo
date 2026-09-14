@@ -167,3 +167,25 @@ la sezione `web_server:` in `Esp32-Pozzo.yaml` — richiede i secrets
 disponibile su `http://<ip-device>/` (protetto da autenticazione digest)
 e non espone comunque l'upload firmware via browser: l'OTA resta
 disponibile solo tramite la piattaforma nativa (API, con password).
+
+
+## Licenza d'uso
+Questo software è fornito "così com'è", senza alcuna garanzia espressa o implicita.
+L'autore declina ogni responsabilità per eventuali danni diretti o indiretti derivanti dall'uso di questo progetto. L'uso è consentito esclusivamente per scopi personali, didattici o di test.
+È vietata la distribuzione commerciale senza autorizzazione scritta dell'autore.
+
+## Riferimenti esterni
+- [Home Assistant](https://www.home-assistant.io/)
+- [EspHome](https://esphome.io/)
+- [Waveshare ESP32-S3-ETH](https://www.waveshare.com/wiki/ESP32-S3-ETH)
+
+## 💬 Supporto
+
+- 🐛 **Bug o problemi?** [Apri un Issue](../../issues)
+- 📧 **Altro?** Contatta @NWItaly
+
+---
+⭐ **Ti piace il progetto?** Metti una stella! Aiuta altri utenti a trovarlo.
+
+## Disclaimer
+Ho fatto largo uso di AI per aiutarmi nella scrittura dell'intero progetto. Ho usato Perplexity, ChatGPT e Claude.

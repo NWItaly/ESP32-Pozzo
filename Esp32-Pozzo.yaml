@@ -20,7 +20,7 @@ esphome:
   # resta sul default più testato, con un delay come margine di sicurezza.
   on_boot:
     then:
-      - delay: 3s  # margine per assicurarsi che l'ultrasonic sia pronto
+      - delay: 3s # margine per assicurarsi che l'ultrasonic sia pronto
       - lambda: |-
           ESP_LOGD("adaptive_interval", "Prima misura al boot");
           id(raw_distance).update();
@@ -93,10 +93,44 @@ binary_sensor:
     lambda: return id(active_mode);
 
 # ---------------------------------------------------------------------------
+# Switch diagnostico per test/calibrazione rapida (es. con metro a mano):
+# se attivo, bypassa completamente la logica attivo/riposo e forza una
+# misura ogni 30 secondi, indipendentemente da active_mode. Da disattivare
+# a fine test per tornare alla cadenza adattiva normale.
+# ---------------------------------------------------------------------------
+switch:
+  - platform: template
+    name: "Debug Fast Interval"
+    id: debug_fast_interval
+    icon: mdi:speedometer
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+# ---------------------------------------------------------------------------
 # Numeri configurabili a runtime (persistiti in flash), regolabili da HA o
 # dal web_server, senza dover riflashare per calibrare l'installazione.
 # ---------------------------------------------------------------------------
 number:
+  # Distanza (cm) sensore -> pelo dell'acqua quando il pozzo è pieno al
+  # 100%. Riferimento geometrico per il calcolo della percentuale, non
+  # una correzione di calibrazione del sensore (quello è Distance Offset,
+  # sopra): full_distance risponde alla domanda "a quale lettura
+  # corrisponde il massimo riempimento reale di questa installazione",
+  # non "quanto sbaglia il sensore". Va tarata osservando la lettura di
+  # Raw Distance quando il pozzo è effettivamente pieno.
+  - platform: template
+    name: "Full Distance"
+    id: full_distance
+    icon: mdi:water-plus
+    entity_category: config
+    min_value: 10
+    max_value: 500
+    step: 1
+    unit_of_measurement: "cm"
+    optimistic: true
+    restore_value: true
+    initial_value: "20"
   - platform: template
     name: "Empty Distance"
     id: empty_distance
@@ -154,6 +188,29 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
+  # Stato del burst di letture ravvicinate (vedi sezione interval):
+  # -1 = nessun burst in corso (riposo per il ticker fine a 2s),
+  # 0/1/2 = letture aggiuntive ancora da richiedere dopo quella in corso.
+  - id: burst_reads_remaining
+    type: int
+    restore_value: false
+    initial_value: "-1"
+  # Buffer dei valori grezzi validi raccolti durante il burst corrente,
+  # usato per calcolare la mediana a fine burst. Array fisso (non
+  # std::vector: con GlobalsComponent genera un costruttore ambiguo in
+  # fase di compilazione, "call of overloaded 'GlobalsComponent(...)' is
+  # ambiguous") di 3 elementi, capienza massima del burst.
+  # burst_median_count tiene traccia di quanti elementi validi sono
+  # stati effettivamente scritti (0..3), dato che l'array in sé non ha
+  # un concetto di "vuoto" come un vector.
+  - id: burst_median_buffer
+    type: float[3]
+    restore_value: false
+    initial_value: "{0.0, 0.0, 0.0}"
+  - id: burst_median_count
+    type: int
+    restore_value: false
+    initial_value: "0"
 
 # ---------------------------------------------------------------------------
 # Cadenza di misura adattiva (opzione "basata sulle differenze"):
@@ -164,13 +221,16 @@ globals:
 #   ogni 1 minuto.
 # - Si torna in modalità RIPOSO dopo 10 minuti consecutivi senza
 #   variazioni sopra soglia.
+# - Se "Debug Fast Interval" è attivo, bypassa tutto quanto sopra e
+#   misura ogni 30 secondi (per test/calibrazione rapida).
 #
 # Il sensore ultrasonico ha update_interval: never ed è pilotato
-# manualmente da questo interval, che gira sempre ogni 1 minuto (il tick
-# più fine) e decide se in quel ciclo è dovuta una misura o va saltato,
-# in base allo stato corrente. Il cambio di modalità stesso avviene
-# invece in on_value del sensore (vedi sotto), non qui: lì si confronta
-# la lettura appena arrivata con la precedente.
+# manualmente da questo interval, che gira sempre ogni 30 secondi (il
+# tick più fine, dettato dalla modalità debug) e decide se in quel ciclo
+# è dovuta una misura o va saltato, in base allo stato corrente. Il
+# cambio di modalità attivo/riposo avviene invece in on_value del
+# sensore (vedi sotto), non qui: lì si confronta la lettura appena
+# arrivata con la precedente.
 #
 # NOTA: nessun vero sleep del chip (ESPHome non espone light sleep in
 # YAML, e il device è alimentato via PoE, non a batteria - vedi
@@ -179,26 +239,38 @@ globals:
 # base di CPU/Ethernet.
 # ---------------------------------------------------------------------------
 interval:
-  - interval: 1min
+  - interval: 30s
     then:
       - lambda: |-
           static int ticks_since_measure = 0;
 
+          // Bypass debug: se attivo, avvia un burst ogni tick (30s) e
+          // salta tutta la logica di countdown/modalità sottostante.
+          if (id(debug_fast_interval).state) {
+            ESP_LOGD("adaptive_interval", "Debug Fast Interval attivo, avvio burst ogni 30s");
+            id(burst_median_count) = 0;
+            id(burst_reads_remaining) = 2; // 1 qui + 2 dal ticker fine = 3 totali
+            id(raw_distance).update();
+            return;
+          }
+
           // Countdown per il ritorno in riposo: se siamo attivi e sono
-          // passati 10 minuti senza che on_value abbia rilevato una
-          // variazione sopra soglia (che azzera il contatore), torniamo
-          // in modalità riposo.
+          // passati 10 minuti (20 tick da 30s) senza che on_value abbia
+          // rilevato una variazione sopra soglia (che azzera il
+          // contatore), torniamo in modalità riposo.
           if (id(active_mode)) {
             id(minutes_since_last_change)++;
-            if (id(minutes_since_last_change) >= 10) {
+            if (id(minutes_since_last_change) >= 20) {
               id(active_mode) = false;
               id(minutes_since_last_change) = 0;
               ESP_LOGI("adaptive_interval", "Nessuna variazione da 10 minuti, torno in modalità riposo (5 min)");
             }
           }
 
-          // In modalità attiva misuriamo ogni tick (1min), in riposo ogni 5.
-          int ticks_needed = id(active_mode) ? 1 : 5;
+          // In modalità attiva misuriamo ogni 2 tick (1min), in riposo
+          // ogni 10 tick (5min). Il tick base ora è 30s (era 1min), per
+          // poter supportare anche il bypass debug a 30s.
+          int ticks_needed = id(active_mode) ? 2 : 10;
 
           ticks_since_measure++;
           ESP_LOGD("adaptive_interval", "Tick %d/%d (active_mode=%s)",
@@ -208,8 +280,87 @@ interval:
           }
           ticks_since_measure = 0;
 
-          ESP_LOGD("adaptive_interval", "Chiamo raw_distance.update()");
+          // Invece di una singola update(), avviamo qui la prima di un
+          // burst di 3 letture ravvicinate: questa chiamata parte subito
+          // (nessun ritardo), le altre 2 le esegue il ticker fine a 2s
+          // qui sotto, perché una lambda non può fare delay() bloccante
+          // senza fermare Ethernet/API/watchdog. burst_reads_remaining=2
+          // dice al ticker fine "quante letture aggiuntive mancano".
+          ESP_LOGD("adaptive_interval", "Avvio burst di 3 letture ravvicinate (1/3 ora)");
+          id(burst_median_count) = 0;
+          id(burst_reads_remaining) = 2;
           id(raw_distance).update();
+
+  # Ticker fine dedicato a proseguire/concludere il burst avviato sopra.
+  # Gira sempre ogni 2s ma non fa nulla se non c'è un burst in corso
+  # (burst_reads_remaining < 0, valore di riposo). Ogni volta che scatta
+  # con un burst attivo, prima raccoglie il risultato dell'update() del
+  # giro precedente (già arrivato dopo 2s, l'echo del JSN-SR04T è
+  # nell'ordine dei ms), poi ne richiede una nuova se ne mancano, o
+  # pubblica la mediana se il burst è concluso.
+  - interval: 2s
+    then:
+      - lambda: |-
+          if (id(burst_reads_remaining) < 0) {
+            return; // nessun burst in corso, nulla da fare
+          }
+
+          // Raccoglie il valore dell'ultima update() (quella avviata 2s
+          // fa, dal tick da 30s o da questo stesso ticker).
+          //
+          // Il sensore "raw_distance" non ha più alcun filtro (rimosso
+          // il vecchio "x*100" per evitare la doppia conversione — vedi
+          // commento sul sensore più sotto), quindi get_state() e
+          // get_raw_state() ora restituiscono lo stesso valore, in
+          // METRI (unità nativa del componente ultrasonic). La
+          // conversione in cm va fatta qui, esplicitamente, UNA SOLA
+          // VOLTA in tutta la catena.
+          float x_metri = id(raw_distance).get_state();
+          float x = x_metri * 100.0f; // metri -> cm, unica conversione
+          if (!std::isnan(x) && x >= 25.0f && x <= id(empty_distance).state) {
+            // Guardia di sicurezza: l'array ha capienza fissa di 3.
+            // Non dovrebbe mai eccedere (il burst è sempre di 3 letture
+            // esatte), ma senza questo controllo un eventuale bug di
+            // conteggio scriverebbe fuori dai limiti dell'array.
+            if (id(burst_median_count) < 3) {
+              id(burst_median_buffer)[id(burst_median_count)] = x;
+              id(burst_median_count)++;
+            }
+          }
+
+          if (id(burst_reads_remaining) > 0) {
+            id(burst_reads_remaining)--;
+            ESP_LOGD("adaptive_interval", "Burst: richiedo lettura (%d rimanenti dopo questa)",
+                     id(burst_reads_remaining));
+            id(raw_distance).update();
+            return;
+          }
+
+          // burst_reads_remaining era 0: questo era l'ultimo giro,
+          // il burst è concluso. Calcola la mediana dei valori validi
+          // raccolti e la pubblica su "Distanza Filtrata" (sensore
+          // template separato, non su raw_distance): quest'ultimo è
+          // solo il sensore fisico di debug e riceve già le sue
+          // pubblicazioni grezze in metri automaticamente a ogni
+          // update() qui sopra, indipendentemente da questo calcolo.
+          id(burst_reads_remaining) = -1; // torna a riposo, ferma il ticker
+
+          int count = id(burst_median_count);
+          if (count == 0) {
+            ESP_LOGW("adaptive_interval", "Burst concluso: nessuna lettura valida su 3, salto pubblicazione");
+            return;
+          }
+          // std::sort accetta anche puntatori grezzi (un array C decade
+          // a puntatore), quindi funziona sull'id() del global tanto
+          // quanto su un std::vector: qui ordiniamo solo i primi "count"
+          // elementi effettivamente scritti, ignorando la coda
+          // eventualmente non popolata dell'array a 3 posizioni.
+          float *buf = id(burst_median_buffer);
+          std::sort(buf, buf + count);
+          float median = buf[count / 2];
+          ESP_LOGD("adaptive_interval", "Burst concluso: %d/3 valide, mediana = %.1f cm",
+                   count, median);
+          id(distanza_filtrata).publish_state(median);
 
 # ---------------------------------------------------------------------------
 # JSN-SR04T in Mode 0 (compatibile HC-SR04, trigger/echo classico).
@@ -228,35 +379,109 @@ interval:
 # su questa board e non è esposto sul connettore: non utilizzabile.
 #
 # update_interval: never — la misura è pilotata manualmente dall'interval
-# qui sopra, per poter variare la cadenza (1min attivo / 5min riposo)
-# invece di un intervallo fisso.
+# qui sopra, per poter variare la cadenza (1min attivo / 5min riposo /
+# 30s debug) invece di un intervallo fisso.
 # ---------------------------------------------------------------------------
 sensor:
   - platform: ultrasonic
     trigger_pin: GPIO17
     echo_pin: GPIO18
-    name: "Raw Distance"
+    name: "Raw Distance (debug)"
     id: raw_distance
-    unit_of_measurement: "cm"
-    accuracy_decimals: 1
+    unit_of_measurement: "m"
+    accuracy_decimals: 3
     update_interval: never
     pulse_time: 400us
     timeout: 4.5m # distanza massima misurabile (metri), non un tempo
-    filters:
-      - median:
-          window_size: 3
-          send_every: 1
-          send_first_at: 1
-      - lambda: return x * 100.0; # ultrasonic component espone metri, convertiamo in cm
+    # Sensore FISICO grezzo, solo per debug/calibrazione: nessun filtro,
+    # espone l'unità nativa del componente ultrasonic (metri). Ogni
+    # chiamata a id(raw_distance).update() (fatta dal ticker del burst
+    # nella sezione interval sopra) pubblica AUTOMATICAMENTE il proprio
+    # valore qui, per ciascuna delle 3 letture del burst - è il
+    # comportamento standard del componente, non modificabile: non è
+    # possibile far "leggere" il sensore senza che pubblichi il suo
+    # stato. Per questo la logica di calcolo (water level, threshold di
+    # modalità attiva/riposo, ecc.) NON sta più qui: sta sul sensore
+    # "Distanza Filtrata" sotto, alimentato solo dalla mediana di fine
+    # burst via publish_state(), non da ogni singola lettura grezza.
+    #
+    # disabled_by_default: true invece di internal: true - resta
+    # un'entità reale in HA (abilitabile al bisogno per vedere le
+    # oscillazioni raw durante calibrazione/debug), semplicemente non
+    # attiva di default. Con update_interval: never il costo di tenerla
+    # abilitata è comunque minimo: non polla mai da sola.
+    disabled_by_default: true
     entity_category: diagnostic
-    # Confronta ogni nuova lettura con la precedente per decidere se
-    # attivare/mantenere la modalità attiva. Con send_every: 1 il filtro
-    # median (finestra 3) serve solo a scartare outlier tra le ultime 3
-    # misure, senza ritardare la pubblicazione come faceva send_every: 5
-    # con un update_interval manuale poco frequente (bug corretto).
+    # NOTA STORICA: qui c'era in precedenza un filtro "lambda: return
+    # x * 100.0" per convertire in cm, poi rimosso. Motivo: se
+    # publish_state() sulla mediana di fine burst viene chiamato su
+    # QUESTO sensore, rientra comunque nella sua catena filtri,
+    # causando una doppia conversione (168,6 cm pubblicati due volte ->
+    # 16.861,9 cm). Con la struttura attuale, raw_distance resta sempre
+    # in metri senza filtri, e la mediana viene pubblicata su un
+    # sensore SEPARATO (Distanza Filtrata, sotto): il problema non si
+    # può più ripresentare per costruzione.
+    #
+    # NOTA STORICA 2: subito dopo il fix sopra, un tentativo di far
+    # convivere "conversione cm" e "pubblicazione della mediana" sullo
+    # STESSO sensore raw_distance ha causato un secondo bug (letture da
+    # 1,7 cm invece di ~170 cm): ogni id(raw_distance).update() del
+    # burst pubblica DA SOLO il proprio valore grezzo in metri (dato di
+    # fabbrica del componente, non aggirabile), quindi tra le 3 letture
+    # del burst e la pubblicazione finale della mediana, HA vedeva
+    # alternare valori in metri e valori in cm sulla stessa entità. La
+    # separazione in due sensori distinti (uno solo debug/raw in metri,
+    # uno solo calcolato/filtrato in cm) elimina l'ambiguità.
+
+  # Sensore filtrato: NON è collegato all'hardware, riceve il suo unico
+  # valore tramite publish_state() dal ticker del burst (sezione
+  # interval sopra), a fine burst, con la mediana delle 3 letture
+  # valide già convertita in cm. Questo è il sensore "ufficiale" usato
+  # da tutta la logica downstream (soglie attivo/riposo, Water Level,
+  # Water Level Percent).
+  - platform: template
+    name: "Distanza Filtrata"
+    id: distanza_filtrata
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    device_class: distance
+    state_class: measurement
+    update_interval: never
+    entity_category: diagnostic
+    # Nessuna lambda qui: il valore arriva solo da publish_state() nel
+    # ticker del burst. on_value sotto scatta ogni volta che quel
+    # publish_state() avviene, cioè una volta per ciclo di misura
+    # completo (non una volta per singola lettura del burst).
     on_value:
       then:
         - lambda: |-
+            // Scarta letture non valide o fuori dal range fisico
+            // plausibile, senza pubblicare nulla (Water Level e Water
+            // Level Percent restano al loro ultimo valore valido).
+            // In pratica qui x sarà quasi sempre valido: il ticker del
+            // burst ha già scartato NaN e fuori-range PRIMA di mettere
+            // un valore nel buffer della mediana (stessi limiti
+            // 25.0f/empty_distance) - questo controllo resta come
+            // seconda rete di sicurezza, es. per il caso limite in cui
+            // TUTTE e 3 le letture del burst siano scartate: in quel
+            // caso il ticker non chiama publish_state() affatto, quindi
+            // questo on_value non scatterebbe nemmeno. Vedi commento
+            // "Burst concluso: nessuna lettura valida su 3" nel ticker.
+            //
+            // std::isnan(x) va controllato PRIMA dei confronti < e >:
+            // in C++/IEEE 754 qualunque confronto con NaN restituisce
+            // sempre false, quindi "x < 25.0f" e "x > empty_distance"
+            // sono entrambi false quando x è NaN, lasciandolo passare
+            // silenziosamente se non lo si intercetta esplicitamente qui.
+            if (std::isnan(x)) {
+              ESP_LOGW("adaptive_interval", "Distanza Filtrata: valore non valido, scartato");
+              return;
+            }
+            if (x < 25.0f || x > id(empty_distance).state) {
+              ESP_LOGW("adaptive_interval", "Distanza Filtrata fuori range (%.1f cm), lettura scartata", x);
+              return;
+            }
+
             static float last_value = NAN;
 
             if (!std::isnan(last_value)) {
@@ -273,18 +498,25 @@ sensor:
             // sensor.template.publish: più semplice da leggere e
             // funzionalmente equivalente (sensor.template.publish lo
             // richiama internamente).
-            if (id(raw_distance).has_state()) {
-              float corrected = x + id(distance_offset).state;
-              float level = id(empty_distance).state - corrected;
-              if (level < 0) level = 0;
-              id(water_level).publish_state(level);
+            //
+            // distance_offset: calibrazione fine del sensore (compensa
+            // un piccolo errore sistematico di lettura), sommata alla
+            // lettura grezza.
+            // full_distance: riferimento geometrico "a quale distanza
+            // corrisponde il 100%", usato SOLO per la percentuale, non
+            // per correggere la lettura. Non va confuso con
+            // distance_offset (vedi commento sul number Full Distance).
+            float corrected = x + id(distance_offset).state;
+            float level = id(empty_distance).state - corrected;
+            if (level < 0) level = 0;
+            id(water_level).publish_state(level);
 
-              if (id(empty_distance).state > 0) {
-                float pct = (level / id(empty_distance).state) * 100.0;
-                if (pct > 100) pct = 100;
-                if (pct < 0) pct = 0;
-                id(water_level_percent).publish_state(pct);
-              }
+            float max_level = id(empty_distance).state - id(full_distance).state;
+            if (max_level > 0) {
+              float pct = (level / max_level) * 100.0;
+              if (pct > 100) pct = 100;
+              if (pct < 0) pct = 0;
+              id(water_level_percent).publish_state(pct);
             }
 
   - platform: template
